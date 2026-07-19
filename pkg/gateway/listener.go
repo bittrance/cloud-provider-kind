@@ -4,19 +4,23 @@ import (
 	"context"
 	"encoding/pem"
 	"fmt"
+	"time"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	extauthzv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_authz/v3"
 	routerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
 	tlsinspector "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/listener/tls_inspector/v3"
 	hcm "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	tcpproxyv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/tcp_proxy/v3"
 	udpproxy "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/udp/udp_proxy/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	matcherv3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
 
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	corev1 "k8s.io/api/core/v1"
@@ -209,7 +213,7 @@ func (c *Controller) validateListeners(gateway *gatewayv1.Gateway) map[gatewayv1
 	return listenerConditions
 }
 
-func (c *Controller) translateListenerToFilterChain(gateway *gatewayv1.Gateway, lis gatewayv1.Listener, virtualHosts []*routev3.VirtualHost, routeName string) (*listener.FilterChain, error) {
+func (c *Controller) translateListenerToFilterChain(gateway *gatewayv1.Gateway, lis gatewayv1.Listener, virtualHosts []*routev3.VirtualHost, routeName string, extAuthConfig *ExternalAuthConfig) (*listener.FilterChain, error) {
 	var filterChain *listener.FilterChain
 
 	switch lis.Protocol {
@@ -220,6 +224,24 @@ func (c *Controller) translateListenerToFilterChain(gateway *gatewayv1.Gateway, 
 			klog.Errorf("Failed to marshal router config: %v", err)
 			return nil, err
 		}
+
+		// Build the ordered list of HTTP filters. The ext_authz filter (if configured)
+		// must appear before the terminal router filter.
+		httpFilters := []*hcm.HttpFilter{}
+		if extAuthConfig != nil {
+			extAuthzFilter, err := buildExtAuthzHTTPFilter(extAuthConfig)
+			if err != nil {
+				klog.Errorf("Failed to build ext_authz filter for listener %s: %v", lis.Name, err)
+			} else {
+				httpFilters = append(httpFilters, extAuthzFilter)
+			}
+		}
+		httpFilters = append(httpFilters, &hcm.HttpFilter{
+			Name: wellknown.Router,
+			ConfigType: &hcm.HttpFilter_TypedConfig{
+				TypedConfig: routerAny,
+			},
+		})
 
 		hcmConfig := &hcm.HttpConnectionManager{
 			StatPrefix: string(lis.Name),
@@ -240,12 +262,7 @@ func (c *Controller) translateListenerToFilterChain(gateway *gatewayv1.Gateway, 
 					RouteConfigName: routeName,
 				},
 			},
-			HttpFilters: []*hcm.HttpFilter{{
-				Name: wellknown.Router,
-				ConfigType: &hcm.HttpFilter_TypedConfig{
-					TypedConfig: routerAny,
-				},
-			}},
+			HttpFilters: httpFilters,
 		}
 		hcmAny, err := anypb.New(hcmConfig)
 		if err != nil {
@@ -430,6 +447,110 @@ func toEnvoyTlsCertificate(secret *corev1.Secret) (*tlsv3.TlsCertificate, error)
 			},
 		},
 	}, nil
+}
+
+// buildExtAuthzHTTPFilter constructs the Envoy ext_authz HCM HTTP filter from
+// an ExternalAuthConfig. The filter is placed before the router filter so that
+// every request passing through this listener's HCM can be checked against the
+// external authorization service before being forwarded upstream.
+func buildExtAuthzHTTPFilter(authConfig *ExternalAuthConfig) (*hcm.HttpFilter, error) {
+	extAuthz := &extauthzv3.ExtAuthz{
+		TransportApiVersion: corev3.ApiVersion_V3,
+	}
+
+	switch authConfig.Protocol {
+	case gatewayv1.HTTPRouteExternalAuthGRPCProtocol:
+		extAuthz.Services = &extauthzv3.ExtAuthz_GrpcService{
+			GrpcService: &corev3.GrpcService{
+				TargetSpecifier: &corev3.GrpcService_EnvoyGrpc_{
+					EnvoyGrpc: &corev3.GrpcService_EnvoyGrpc{
+						ClusterName: authConfig.ClusterName,
+					},
+				},
+			},
+		}
+		if authConfig.GRPCAuthConfig != nil && len(authConfig.GRPCAuthConfig.AllowedRequestHeaders) > 0 {
+			extAuthz.AllowedHeaders = stringsToListStringMatcher(authConfig.GRPCAuthConfig.AllowedRequestHeaders)
+		}
+
+	case gatewayv1.HTTPRouteExternalAuthHTTPProtocol:
+		httpSvc := &extauthzv3.HttpService{
+			ServerUri: &corev3.HttpUri{
+				Uri: fmt.Sprintf("http://%s", authConfig.ClusterName),
+				HttpUpstreamType: &corev3.HttpUri_Cluster{
+					Cluster: authConfig.ClusterName,
+				},
+				Timeout: durationpb.New(5 * time.Second),
+			},
+		}
+		if authConfig.HTTPAuthConfig != nil {
+			if authConfig.HTTPAuthConfig.Path != "" {
+				httpSvc.PathPrefix = authConfig.HTTPAuthConfig.Path
+			}
+			if len(authConfig.HTTPAuthConfig.AllowedRequestHeaders) > 0 {
+				httpSvc.AuthorizationRequest = &extauthzv3.AuthorizationRequest{
+					AllowedHeaders: stringsToListStringMatcher(authConfig.HTTPAuthConfig.AllowedRequestHeaders),
+				}
+			}
+			if len(authConfig.HTTPAuthConfig.AllowedResponseHeaders) > 0 {
+				httpSvc.AuthorizationResponse = &extauthzv3.AuthorizationResponse{
+					AllowedUpstreamHeaders: stringsToListStringMatcher(authConfig.HTTPAuthConfig.AllowedResponseHeaders),
+				}
+			}
+		}
+		extAuthz.Services = &extauthzv3.ExtAuthz_HttpService{HttpService: httpSvc}
+	}
+
+	if authConfig.ForwardBody != nil && authConfig.ForwardBody.MaxSize > 0 {
+		extAuthz.WithRequestBody = &extauthzv3.BufferSettings{
+			MaxRequestBytes: uint32(authConfig.ForwardBody.MaxSize),
+		}
+	}
+
+	extAuthzAny, err := anypb.New(extAuthz)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal ext_authz filter: %w", err)
+	}
+	return &hcm.HttpFilter{
+		Name:       wellknown.HTTPExternalAuthorization,
+		ConfigType: &hcm.HttpFilter_TypedConfig{TypedConfig: extAuthzAny},
+	}, nil
+}
+
+// disableExtAuthzOnRoutes adds an explicit "disabled" ExtAuthzPerRoute config to every
+// route in the given virtual-host map that does not already carry an ExternalAuth marker.
+// This prevents the port-level ext_authz HCM filter from running on routes that were
+// not explicitly configured with an ExternalAuth filter in their HTTPRoute rule.
+func disableExtAuthzOnRoutes(virtualHosts map[string]*routev3.VirtualHost) error {
+	disabledAny, err := anypb.New(&extauthzv3.ExtAuthzPerRoute{
+		Override: &extauthzv3.ExtAuthzPerRoute_Disabled{Disabled: true},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to marshal ext_authz disabled per-route config: %w", err)
+	}
+	for _, vh := range virtualHosts {
+		for _, route := range vh.Routes {
+			if _, hasAuth := route.TypedPerFilterConfig[wellknown.HTTPExternalAuthorization]; !hasAuth {
+				if route.TypedPerFilterConfig == nil {
+					route.TypedPerFilterConfig = make(map[string]*anypb.Any)
+				}
+				route.TypedPerFilterConfig[wellknown.HTTPExternalAuthorization] = disabledAny
+			}
+		}
+	}
+	return nil
+}
+
+// stringsToListStringMatcher converts a list of exact header name strings into the
+// Envoy ListStringMatcher type used by the ext_authz filter's allowed-headers fields.
+func stringsToListStringMatcher(headers []string) *matcherv3.ListStringMatcher {
+	patterns := make([]*matcherv3.StringMatcher, 0, len(headers))
+	for _, h := range headers {
+		patterns = append(patterns, &matcherv3.StringMatcher{
+			MatchPattern: &matcherv3.StringMatcher_Exact{Exact: h},
+		})
+	}
+	return &matcherv3.ListStringMatcher{Patterns: patterns}
 }
 
 func createEnvoyAddress(port uint32) *corev3.Address {

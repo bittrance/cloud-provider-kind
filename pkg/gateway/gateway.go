@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
@@ -16,6 +17,7 @@ import (
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	upstreamsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	envoyproxytypes "github.com/envoyproxy/go-control-plane/pkg/cache/types"
 	cachev3 "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
@@ -188,6 +190,10 @@ func (c *Controller) buildEnvoyResourcesForGateway(gateway *gatewayv1.Gateway) (
 		// Prepare to collect ALL virtual hosts for this port into a single list.
 		virtualHostsForPort := make(map[string]*routev3.VirtualHost)
 		routeName := fmt.Sprintf("route-%d", port)
+		// portExtAuthConfig holds the first ExternalAuth configuration encountered on
+		// this port. It is used to wire up the ext_authz HTTP filter in the HCM for
+		// every filter chain on this port.
+		var portExtAuthConfig *ExternalAuthConfig
 
 		// All these listeners have the same port
 		for _, listener := range listeners {
@@ -250,7 +256,7 @@ func (c *Controller) buildEnvoyResourcesForGateway(gateway *gatewayv1.Gateway) (
 				// Process HTTPRoutes
 				// Get the routes that were pre-validated for this specific listener.
 				for _, httpRoute := range routesByListener[listener.Name] {
-					routes, validBackendRefs, routeConditions := translateHTTPRouteToEnvoyRoutes(httpRoute, c.serviceLister, c.referenceGrantLister)
+					routes, extAuthConfigs, validBackendRefs, routeConditions := translateHTTPRouteToEnvoyRoutes(httpRoute, c.serviceLister, c.referenceGrantLister)
 
 					key := types.NamespacedName{Name: httpRoute.Name, Namespace: httpRoute.Namespace}
 					currentParentStatuses := httpRouteStatuses[key]
@@ -271,6 +277,30 @@ func (c *Controller) buildEnvoyResourcesForGateway(gateway *gatewayv1.Gateway) (
 							if _, exists := envoyClusters[cluster.Name]; !exists {
 								envoyClusters[cluster.Name] = cluster
 							}
+						}
+					}
+
+					// Create Envoy clusters for ExternalAuth backends and capture the
+					// first auth config seen on this port for HCM filter wiring.
+					for i := range extAuthConfigs {
+						authCfg := &extAuthConfigs[i]
+						authBackendRef := gatewayv1.BackendRef{BackendObjectReference: authCfg.BackendRef}
+						cluster, err := c.translateBackendRefToCluster(authCfg.Namespace, authBackendRef)
+						if err == nil && cluster != nil {
+							// gRPC ext_authz communicates over HTTP/2; without explicit HTTP/2
+							// protocol options the connection falls back to HTTP/1.1 and the
+							// gRPC call fails, causing Envoy to return 403 (fail-closed).
+							if authCfg.Protocol == gatewayv1.HTTPRouteExternalAuthGRPCProtocol {
+								if h2Err := enableHTTP2OnCluster(cluster); h2Err != nil {
+									klog.Warningf("Failed to enable HTTP/2 on auth cluster %s: %v", cluster.Name, h2Err)
+								}
+							}
+							if _, exists := envoyClusters[cluster.Name]; !exists {
+								envoyClusters[cluster.Name] = cluster
+							}
+						}
+						if portExtAuthConfig == nil {
+							portExtAuthConfig = authCfg
 						}
 					}
 
@@ -311,7 +341,7 @@ func (c *Controller) buildEnvoyResourcesForGateway(gateway *gatewayv1.Gateway) (
 				vhSlice = append(vhSlice, vh)
 			}
 
-			filterChain, err := c.translateListenerToFilterChain(gateway, listener, vhSlice, routeName)
+			filterChain, err := c.translateListenerToFilterChain(gateway, listener, vhSlice, routeName, portExtAuthConfig)
 			if err != nil {
 				meta.SetStatusCondition(&listenerStatus.Conditions, metav1.Condition{
 					Type:               string(gatewayv1.ListenerConditionProgrammed),
@@ -343,6 +373,17 @@ func (c *Controller) buildEnvoyResourcesForGateway(gateway *gatewayv1.Gateway) (
 			allListenerStatuses[listener.Name] = listenerStatus
 		}
 
+		// If any route on this port requires ExternalAuth, mark every route that does
+		// NOT carry an ExternalAuth marker with an explicit "disabled" per-route config.
+		// This prevents the port-level ext_authz HCM filter from running on routes that
+		// were not configured with an ExternalAuth filter. Routes are shared across all
+		// filter chains via RDS, so this step must happen after all routes are collected.
+		if portExtAuthConfig != nil {
+			if err := disableExtAuthzOnRoutes(virtualHostsForPort); err != nil {
+				klog.Errorf("Failed to disable ext_authz on non-auth routes for port %d: %v", port, err)
+			}
+		}
+
 		allVirtualHosts := make([]*routev3.VirtualHost, 0, len(virtualHostsForPort))
 		for _, vh := range virtualHostsForPort {
 			sortRoutes(vh.Routes)
@@ -369,7 +410,7 @@ func (c *Controller) buildEnvoyResourcesForGateway(gateway *gatewayv1.Gateway) (
 			// For HTTPS, we create one filter chain per listener because they have unique
 			// SNI matches and TLS settings.
 			if listeners[0].Protocol == gatewayv1.HTTPProtocolType {
-				filterChain, _ := c.translateListenerToFilterChain(gateway, listeners[0], allVirtualHosts, routeName)
+				filterChain, _ := c.translateListenerToFilterChain(gateway, listeners[0], allVirtualHosts, routeName, portExtAuthConfig)
 				envoyListener.FilterChains = []*listenerv3.FilterChain{filterChain}
 			}
 			finalEnvoyListeners = append(finalEnvoyListeners, envoyListener)
@@ -625,6 +666,19 @@ func (c *Controller) areBackendsValid(httpRoute *gatewayv1.HTTPRoute) bool {
 				return false
 			}
 		}
+		// Also validate the backend referenced by an ExternalAuth filter, if present.
+		for _, filter := range rule.Filters {
+			if filter.Type != gatewayv1.HTTPRouteFilterExternalAuth || filter.ExternalAuth == nil {
+				continue
+			}
+			ns := httpRoute.Namespace
+			if filter.ExternalAuth.BackendRef.Namespace != nil {
+				ns = string(*filter.ExternalAuth.BackendRef.Namespace)
+			}
+			if _, err := c.serviceLister.Services(ns).Get(string(filter.ExternalAuth.BackendRef.Name)); err != nil {
+				return false
+			}
+		}
 	}
 	return true
 }
@@ -689,6 +743,31 @@ func (c *Controller) translateBackendRefToCluster(defaultNamespace string, backe
 	}
 
 	return cluster, nil
+}
+
+// enableHTTP2OnCluster configures the cluster to use HTTP/2 for upstream connections.
+// This is required for gRPC services (e.g. ext_authz backends): without it Envoy
+// negotiates HTTP/1.1, the gRPC call fails, and the default fail-closed behaviour
+// returns a 403 to the client.
+func enableHTTP2OnCluster(cluster *clusterv3.Cluster) error {
+	httpProtocolOptions := &upstreamsv3.HttpProtocolOptions{
+		UpstreamProtocolOptions: &upstreamsv3.HttpProtocolOptions_ExplicitHttpConfig_{
+			ExplicitHttpConfig: &upstreamsv3.HttpProtocolOptions_ExplicitHttpConfig{
+				ProtocolConfig: &upstreamsv3.HttpProtocolOptions_ExplicitHttpConfig_Http2ProtocolOptions{
+					Http2ProtocolOptions: &corev3.Http2ProtocolOptions{},
+				},
+			},
+		},
+	}
+	any, err := anypb.New(httpProtocolOptions)
+	if err != nil {
+		return fmt.Errorf("failed to marshal HTTP/2 protocol options: %w", err)
+	}
+	if cluster.TypedExtensionProtocolOptions == nil {
+		cluster.TypedExtensionProtocolOptions = make(map[string]*anypb.Any)
+	}
+	cluster.TypedExtensionProtocolOptions["envoy.extensions.upstreams.http.v3.HttpProtocolOptions"] = any
+	return nil
 }
 
 func (c *Controller) deleteGatewayResources(ctx context.Context, name, namespace string) error {

@@ -8,7 +8,10 @@ import (
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	extauthzv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_authz/v3"
 	matcherv3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
+	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
+	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -17,14 +20,38 @@ import (
 	gatewaylistersv1 "sigs.k8s.io/gateway-api/pkg/client/listers/apis/v1"
 )
 
+// ExternalAuthConfig holds the configuration for an external authorization service
+// referenced by an HTTPRoute ExternalAuth filter. It is collected during route
+// translation and later used to configure the ext_authz HTTP filter in the
+// Envoy HCM for the relevant listener(s).
+type ExternalAuthConfig struct {
+	// ClusterName is the derived Envoy cluster name for the auth backend.
+	ClusterName string
+	// BackendRef is the original reference to the auth backend service.
+	BackendRef gatewayv1.BackendObjectReference
+	// Namespace is the HTTPRoute's namespace, used as the default namespace for the backend.
+	Namespace string
+	// Protocol specifies whether to use HTTP or gRPC to reach the auth server.
+	Protocol gatewayv1.HTTPRouteExternalAuthProtocol
+	// GRPCAuthConfig holds gRPC-specific configuration (non-nil when Protocol is GRPC).
+	GRPCAuthConfig *gatewayv1.GRPCAuthConfig
+	// HTTPAuthConfig holds HTTP-specific configuration (non-nil when Protocol is HTTP).
+	HTTPAuthConfig *gatewayv1.HTTPAuthConfig
+	// ForwardBody controls whether and how much of the request body to forward.
+	ForwardBody *gatewayv1.ForwardBodyConfig
+}
+
 // translateHTTPRouteToEnvoyRoutes translates a full HTTPRoute into a slice of Envoy Routes.
+// It also returns any ExternalAuth configurations found in the route's filters, so the
+// caller can configure the corresponding ext_authz HTTP filter on the listener.
 func translateHTTPRouteToEnvoyRoutes(
 	httpRoute *gatewayv1.HTTPRoute,
 	serviceLister corev1listers.ServiceLister,
 	referenceGrantLister gatewaylistersv1.ReferenceGrantLister,
-) ([]*routev3.Route, []gatewayv1.BackendRef, []metav1.Condition) {
+) ([]*routev3.Route, []ExternalAuthConfig, []gatewayv1.BackendRef, []metav1.Condition) {
 
 	var envoyRoutes []*routev3.Route
+	var allExtAuthConfigs []ExternalAuthConfig
 	var allValidBackendRefs []gatewayv1.BackendRef
 	resolvedRefsCondition := createSuccessCondition(httpRoute.Generation)
 
@@ -41,6 +68,7 @@ func translateHTTPRouteToEnvoyRoutes(
 		var redirectAction *routev3.RedirectAction
 		var headersToAdd []*corev3.HeaderValueOption
 		var headersToRemove []string
+		var ruleExtAuthConfig *ExternalAuthConfig
 		for _, filter := range rule.Filters {
 			if filter.Type == gatewayv1.HTTPRouteFilterRequestRedirect && filter.RequestRedirect != nil {
 				redirect := filter.RequestRedirect
@@ -102,6 +130,38 @@ func translateHTTPRouteToEnvoyRoutes(
 				// Handle "remove" actions
 				headersToRemove = append(headersToRemove, filter.RequestHeaderModifier.Remove...)
 			}
+
+			if filter.Type == gatewayv1.HTTPRouteFilterExternalAuth && filter.ExternalAuth != nil {
+				ea := filter.ExternalAuth
+				backendRef := gatewayv1.BackendRef{BackendObjectReference: ea.BackendRef}
+
+				// Validate that the referenced service exists before building the config.
+				authNs := httpRoute.Namespace
+				if ea.BackendRef.Namespace != nil {
+					authNs = string(*ea.BackendRef.Namespace)
+				}
+				if _, err := serviceLister.Services(authNs).Get(string(ea.BackendRef.Name)); err != nil {
+					resolvedRefsCondition = createFailureCondition(
+						gatewayv1.RouteReasonBackendNotFound,
+						fmt.Sprintf("ExternalAuth backend %s/%s not found", authNs, ea.BackendRef.Name),
+						httpRoute.Generation,
+					)
+				} else if clusterName, err := backendRefToClusterName(httpRoute.Namespace, backendRef); err == nil {
+					ruleExtAuthConfig = &ExternalAuthConfig{
+						ClusterName:    clusterName,
+						BackendRef:     ea.BackendRef,
+						Namespace:      httpRoute.Namespace,
+						Protocol:       ea.ExternalAuthProtocol,
+						GRPCAuthConfig: ea.GRPCAuthConfig,
+						HTTPAuthConfig: ea.HTTPAuthConfig,
+						ForwardBody:    ea.ForwardBody,
+					}
+				}
+			}
+		}
+
+		if ruleExtAuthConfig != nil {
+			allExtAuthConfigs = append(allExtAuthConfigs, *ruleExtAuthConfig)
 		}
 
 		buildRoutesForRule := func(match gatewayv1.HTTPRouteMatch, matchIndex int) {
@@ -116,6 +176,22 @@ func translateHTTPRouteToEnvoyRoutes(
 				Match:                  routeMatch,
 				RequestHeadersToAdd:    headersToAdd,
 				RequestHeadersToRemove: headersToRemove,
+			}
+
+			// For routes with ExternalAuth, mark them so the HCM ext_authz filter
+			// applies only to these routes (routes without this marker will be
+			// explicitly disabled by the caller after all routes are collected).
+			if ruleExtAuthConfig != nil {
+				extAuthzPerRoute := &extauthzv3.ExtAuthzPerRoute{
+					Override: &extauthzv3.ExtAuthzPerRoute_CheckSettings{
+						CheckSettings: &extauthzv3.CheckSettings{},
+					},
+				}
+				if perRouteAny, err := anypb.New(extAuthzPerRoute); err == nil {
+					envoyRoute.TypedPerFilterConfig = map[string]*anypb.Any{
+						wellknown.HTTPExternalAuthorization: perRouteAny,
+					}
+				}
 			}
 
 			if redirectAction != nil {
@@ -159,7 +235,7 @@ func translateHTTPRouteToEnvoyRoutes(
 	invalidRuleCount := len(droppedRuleMessages)
 	if invalidRuleCount > 0 && invalidRuleCount == totalRules {
 		msg := fmt.Sprintf("no rules could be translated: %s", strings.Join(droppedRuleMessages, "; "))
-		return nil, nil, []metav1.Condition{
+		return nil, nil, nil, []metav1.Condition{
 			createFailureCondition(gatewayv1.RouteReasonUnsupportedValue, msg, httpRoute.Generation),
 		}
 	}
@@ -169,7 +245,7 @@ func translateHTTPRouteToEnvoyRoutes(
 		msg := fmt.Sprintf("Dropped Rule(s): %s", strings.Join(droppedRuleMessages, "; "))
 		conditions = append(conditions, createPartiallyInvalidCondition(msg, httpRoute.Generation))
 	}
-	return envoyRoutes, allValidBackendRefs, conditions
+	return envoyRoutes, allExtAuthConfigs, allValidBackendRefs, conditions
 }
 
 // findUnsupportedFilter returns the first filter type in the list that is not
@@ -178,7 +254,8 @@ func findUnsupportedFilter(filters []gatewayv1.HTTPRouteFilter) (gatewayv1.HTTPR
 	for _, filter := range filters {
 		switch filter.Type {
 		case gatewayv1.HTTPRouteFilterRequestRedirect,
-			gatewayv1.HTTPRouteFilterRequestHeaderModifier:
+			gatewayv1.HTTPRouteFilterRequestHeaderModifier,
+			gatewayv1.HTTPRouteFilterExternalAuth:
 		default:
 			return filter.Type, true
 		}
