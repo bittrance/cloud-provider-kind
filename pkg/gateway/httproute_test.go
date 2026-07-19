@@ -124,6 +124,7 @@ func responsHeaderFilter() gatewayv1.HTTPRouteFilter {
 	}
 }
 
+
 func TestTranslateHTTPRouteToEnvoyRoutes_FilterValidation(t *testing.T) {
 	svc := makeService("default", "svc", 80)
 	svcLister := newMockServiceLister(svc)
@@ -221,7 +222,7 @@ func TestTranslateHTTPRouteToEnvoyRoutes_FilterValidation(t *testing.T) {
 			route := baseRoute.DeepCopy()
 			route.Spec.Rules = tt.rules
 
-			routes, _, conditions := translateHTTPRouteToEnvoyRoutes(route, svcLister, noGrants)
+			routes, _, _, conditions := translateHTTPRouteToEnvoyRoutes(route, svcLister, noGrants)
 
 			// Check route count.
 			if tt.wantRoutes == 0 && len(routes) != 0 {
@@ -271,3 +272,4 @@ func TestTranslateHTTPRouteToEnvoyRoutes_FilterValidation(t *testing.T) {
 		})
 	}
 }
+

@@ -8,7 +8,9 @@ import (
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	hcm "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	matcherv3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
+	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -17,14 +19,156 @@ import (
 	gatewaylistersv1 "sigs.k8s.io/gateway-api/pkg/client/listers/apis/v1"
 )
 
-// translateHTTPRouteToEnvoyRoutes translates a full HTTPRoute into a slice of Envoy Routes.
+// HCMFilterConfig describes an HCM-level HTTP filter required by a route rule,
+// together with any upstream cluster that must be provisioned to support it.
+// It is returned by translateHTTPRouteToEnvoyRoutes and consumed by gateway.go
+// (cluster provisioning) and listener.go (HCM filter installation).
+type HCMFilterConfig struct {
+	// FilterName is the Envoy well-known filter name; also used as the
+	// TypedPerFilterConfig map key.
+	FilterName string
+	// BackendRef, if non-nil, identifies the upstream Service to provision a
+	// cluster for.
+	BackendRef *gatewayv1.BackendObjectReference
+	BackendNs  string
+	// EnableHTTP2 requests H2 on the upstream cluster (required for gRPC backends).
+	EnableHTTP2 bool
+	// buildHCMFilter constructs the Envoy HCM HttpFilter proto for this filter.
+	buildHCMFilter func() (*hcm.HttpFilter, error)
+	// buildDisabledPerRouteConfig, if non-nil, returns the TypedPerFilterConfig
+	// entry to stamp onto routes that should bypass this HCM filter.
+	buildDisabledPerRouteConfig func() (*anypb.Any, error)
+}
+
+// ruleFilterState accumulates the Envoy-side effects of translating all filters
+// on a single HTTPRoute rule.
+type ruleFilterState struct {
+	// redirect, if non-nil, replaces the rule's forwarding action with a redirect.
+	redirect *routev3.RedirectAction
+	// reqHeadersToAdd / reqHeadersToRemove mutate request headers on every route
+	// produced for this rule.
+	reqHeadersToAdd    []*corev3.HeaderValueOption
+	reqHeadersToRemove []string
+	// typedPerFilterConfig holds per-route filter config entries to stamp onto
+	// every Envoy route produced for this rule.
+	typedPerFilterConfig map[string]*anypb.Any
+	// hcmFilters holds HCM-level filter requirements arising from this rule.
+	hcmFilters []HCMFilterConfig
+	// resolvedRefsErr, if non-nil, overrides the route's ResolvedRefs condition.
+	resolvedRefsErr *metav1.Condition
+}
+
+// merge folds other into the receiver, with "last writer wins" for redirect and
+// resolvedRefsErr.
+func (s *ruleFilterState) merge(other ruleFilterState) {
+	if other.redirect != nil {
+		s.redirect = other.redirect
+	}
+	s.reqHeadersToAdd = append(s.reqHeadersToAdd, other.reqHeadersToAdd...)
+	s.reqHeadersToRemove = append(s.reqHeadersToRemove, other.reqHeadersToRemove...)
+	for k, v := range other.typedPerFilterConfig {
+		if s.typedPerFilterConfig == nil {
+			s.typedPerFilterConfig = make(map[string]*anypb.Any)
+		}
+		s.typedPerFilterConfig[k] = v
+	}
+	s.hcmFilters = append(s.hcmFilters, other.hcmFilters...)
+	if other.resolvedRefsErr != nil {
+		s.resolvedRefsErr = other.resolvedRefsErr
+	}
+}
+
+// translateRuleFilters translates every filter in a single HTTPRoute rule into
+// a ruleFilterState.  On the first unsupported filter type it returns a non-empty
+// unsupportedType and stops processing further filters.
+func translateRuleFilters(
+	filters []gatewayv1.HTTPRouteFilter,
+	routeNs string,
+	generation int64,
+	svcLister corev1listers.ServiceLister,
+) (state ruleFilterState, unsupportedType gatewayv1.HTTPRouteFilterType) {
+	for _, filter := range filters {
+		switch filter.Type {
+		case gatewayv1.HTTPRouteFilterRequestRedirect:
+			if filter.RequestRedirect != nil {
+				state.merge(translateRequestRedirectFilter(filter.RequestRedirect))
+				// Per spec only one redirect per rule is valid; stop processing.
+				return
+			}
+		case gatewayv1.HTTPRouteFilterRequestHeaderModifier:
+			if filter.RequestHeaderModifier != nil {
+				state.merge(translateRequestHeaderModifierFilter(filter.RequestHeaderModifier))
+			}
+		default:
+			return ruleFilterState{}, filter.Type
+		}
+	}
+	return
+}
+
+// translateRequestRedirectFilter translates a RequestRedirect filter.
+func translateRequestRedirectFilter(f *gatewayv1.HTTPRequestRedirectFilter) ruleFilterState {
+	redirectAction := &routev3.RedirectAction{}
+	if f.Hostname != nil {
+		redirectAction.HostRedirect = string(*f.Hostname)
+	}
+	if f.StatusCode != nil {
+		switch *f.StatusCode {
+		case 301:
+			redirectAction.ResponseCode = routev3.RedirectAction_MOVED_PERMANENTLY
+		case 302:
+			redirectAction.ResponseCode = routev3.RedirectAction_FOUND
+		case 303:
+			redirectAction.ResponseCode = routev3.RedirectAction_SEE_OTHER
+		case 307:
+			redirectAction.ResponseCode = routev3.RedirectAction_TEMPORARY_REDIRECT
+		case 308:
+			redirectAction.ResponseCode = routev3.RedirectAction_PERMANENT_REDIRECT
+		default:
+			redirectAction.ResponseCode = routev3.RedirectAction_MOVED_PERMANENTLY
+		}
+	} else {
+		// Gateway API defaults to 302.
+		redirectAction.ResponseCode = routev3.RedirectAction_FOUND
+	}
+	return ruleFilterState{redirect: redirectAction}
+}
+
+// translateRequestHeaderModifierFilter translates a RequestHeaderModifier filter.
+func translateRequestHeaderModifierFilter(f *gatewayv1.HTTPHeaderFilter) ruleFilterState {
+	var state ruleFilterState
+	for _, header := range f.Set {
+		state.reqHeadersToAdd = append(state.reqHeadersToAdd, &corev3.HeaderValueOption{
+			Header:       &corev3.HeaderValue{Key: string(header.Name), Value: header.Value},
+			AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+		})
+	}
+	for _, header := range f.Add {
+		state.reqHeadersToAdd = append(state.reqHeadersToAdd, &corev3.HeaderValueOption{
+			Header:       &corev3.HeaderValue{Key: string(header.Name), Value: header.Value},
+			AppendAction: corev3.HeaderValueOption_APPEND_IF_EXISTS_OR_ADD,
+		})
+	}
+	state.reqHeadersToRemove = append(state.reqHeadersToRemove, f.Remove...)
+	return state
+}
+
+// translateHTTPRouteToEnvoyRoutes translates a full HTTPRoute into a slice of
+// Envoy Routes.  It also returns:
+//   - hcmFilterConfigs: one entry per HCM-level filter required by the route's
+//     rules (e.g. ext_authz); the caller provisions the corresponding clusters
+//     and installs the filters in the listener's HCM.
+//   - validBackendRefs: the resolved upstream backend refs; the caller provisions
+//     their Envoy clusters.
+//   - conditions: ResolvedRefs (and optionally PartiallyInvalid) status conditions.
 func translateHTTPRouteToEnvoyRoutes(
 	httpRoute *gatewayv1.HTTPRoute,
 	serviceLister corev1listers.ServiceLister,
 	referenceGrantLister gatewaylistersv1.ReferenceGrantLister,
-) ([]*routev3.Route, []gatewayv1.BackendRef, []metav1.Condition) {
+) ([]*routev3.Route, []HCMFilterConfig, []gatewayv1.BackendRef, []metav1.Condition) {
 
 	var envoyRoutes []*routev3.Route
+	var allHCMFilterConfigs []HCMFilterConfig
 	var allValidBackendRefs []gatewayv1.BackendRef
 	resolvedRefsCondition := createSuccessCondition(httpRoute.Generation)
 
@@ -32,77 +176,20 @@ func translateHTTPRouteToEnvoyRoutes(
 	var droppedRuleMessages []string
 
 	for ruleIndex, rule := range httpRoute.Spec.Rules {
-		if unsupportedType, found := findUnsupportedFilter(rule.Filters); found {
+		filterState, unsupportedType := translateRuleFilters(
+			rule.Filters, httpRoute.Namespace, httpRoute.Generation, serviceLister,
+		)
+		if unsupportedType != "" {
 			droppedRuleMessages = append(droppedRuleMessages,
 				fmt.Sprintf("rule[%d] has unsupported filter type %q", ruleIndex, unsupportedType))
 			continue
 		}
 
-		var redirectAction *routev3.RedirectAction
-		var headersToAdd []*corev3.HeaderValueOption
-		var headersToRemove []string
-		for _, filter := range rule.Filters {
-			if filter.Type == gatewayv1.HTTPRouteFilterRequestRedirect && filter.RequestRedirect != nil {
-				redirect := filter.RequestRedirect
-				redirectAction = &routev3.RedirectAction{}
-
-				if redirect.Hostname != nil {
-					redirectAction.HostRedirect = string(*redirect.Hostname)
-				}
-
-				if redirect.StatusCode != nil {
-					switch *redirect.StatusCode {
-					case 301:
-						redirectAction.ResponseCode = routev3.RedirectAction_MOVED_PERMANENTLY
-					case 302:
-						redirectAction.ResponseCode = routev3.RedirectAction_FOUND
-					case 303:
-						redirectAction.ResponseCode = routev3.RedirectAction_SEE_OTHER
-					case 307:
-						redirectAction.ResponseCode = routev3.RedirectAction_TEMPORARY_REDIRECT
-					case 308:
-						redirectAction.ResponseCode = routev3.RedirectAction_PERMANENT_REDIRECT
-					default:
-						redirectAction.ResponseCode = routev3.RedirectAction_MOVED_PERMANENTLY
-					}
-				} else {
-					// The Gateway API spec defaults to a 302 redirect.
-					// The corresponding Envoy enum is "FOUND".
-					redirectAction.ResponseCode = routev3.RedirectAction_FOUND
-				}
-
-				break // Only one redirect filter is allowed per rule.
-			}
-
-			if filter.Type == gatewayv1.HTTPRouteFilterRequestHeaderModifier && filter.RequestHeaderModifier != nil {
-				// Handle "set" actions (overwrite)
-				for _, header := range filter.RequestHeaderModifier.Set {
-					headersToAdd = append(headersToAdd, &corev3.HeaderValueOption{
-						Header: &corev3.HeaderValue{
-							Key:   string(header.Name),
-							Value: header.Value,
-						},
-						// This tells Envoy to overwrite the header if it exists.
-						AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
-					})
-				}
-
-				// Handle "add" actions (append)
-				for _, header := range filter.RequestHeaderModifier.Add {
-					headersToAdd = append(headersToAdd, &corev3.HeaderValueOption{
-						Header: &corev3.HeaderValue{
-							Key:   string(header.Name),
-							Value: header.Value,
-						},
-						// This tells Envoy to append the value if the header already exists.
-						AppendAction: corev3.HeaderValueOption_APPEND_IF_EXISTS_OR_ADD,
-					})
-				}
-
-				// Handle "remove" actions
-				headersToRemove = append(headersToRemove, filter.RequestHeaderModifier.Remove...)
-			}
+		if filterState.resolvedRefsErr != nil {
+			resolvedRefsCondition = *filterState.resolvedRefsErr
 		}
+
+		allHCMFilterConfigs = append(allHCMFilterConfigs, filterState.hcmFilters...)
 
 		buildRoutesForRule := func(match gatewayv1.HTTPRouteMatch, matchIndex int) {
 			routeMatch, matchCondition := translateHTTPRouteMatch(match, httpRoute.Generation)
@@ -114,17 +201,14 @@ func translateHTTPRouteToEnvoyRoutes(
 			envoyRoute := &routev3.Route{
 				Name:                   fmt.Sprintf("%s-%s-rule%d-match%d", httpRoute.Namespace, httpRoute.Name, ruleIndex, matchIndex),
 				Match:                  routeMatch,
-				RequestHeadersToAdd:    headersToAdd,
-				RequestHeadersToRemove: headersToRemove,
+				RequestHeadersToAdd:    filterState.reqHeadersToAdd,
+				RequestHeadersToRemove: filterState.reqHeadersToRemove,
+				TypedPerFilterConfig:   filterState.typedPerFilterConfig,
 			}
 
-			if redirectAction != nil {
-				// If this is a redirect, set the Redirect action. No backends are needed.
-				envoyRoute.Action = &routev3.Route_Redirect{
-					Redirect: redirectAction,
-				}
+			if filterState.redirect != nil {
+				envoyRoute.Action = &routev3.Route_Redirect{Redirect: filterState.redirect}
 			} else {
-				// Attempt to build the forwarding action and get valid backends.
 				routeAction, validBackends, err := buildHTTPRouteAction(
 					httpRoute.Namespace,
 					rule.BackendRefs,
@@ -139,9 +223,7 @@ func translateHTTPRouteToEnvoyRoutes(
 					}
 				} else {
 					allValidBackendRefs = append(allValidBackendRefs, validBackends...)
-					envoyRoute.Action = &routev3.Route_Route{
-						Route: routeAction,
-					}
+					envoyRoute.Action = &routev3.Route_Route{Route: routeAction}
 				}
 			}
 			envoyRoutes = append(envoyRoutes, envoyRoute)
@@ -159,7 +241,7 @@ func translateHTTPRouteToEnvoyRoutes(
 	invalidRuleCount := len(droppedRuleMessages)
 	if invalidRuleCount > 0 && invalidRuleCount == totalRules {
 		msg := fmt.Sprintf("no rules could be translated: %s", strings.Join(droppedRuleMessages, "; "))
-		return nil, nil, []metav1.Condition{
+		return nil, nil, nil, []metav1.Condition{
 			createFailureCondition(gatewayv1.RouteReasonUnsupportedValue, msg, httpRoute.Generation),
 		}
 	}
@@ -169,21 +251,7 @@ func translateHTTPRouteToEnvoyRoutes(
 		msg := fmt.Sprintf("Dropped Rule(s): %s", strings.Join(droppedRuleMessages, "; "))
 		conditions = append(conditions, createPartiallyInvalidCondition(msg, httpRoute.Generation))
 	}
-	return envoyRoutes, allValidBackendRefs, conditions
-}
-
-// findUnsupportedFilter returns the first filter type in the list that is not
-// implemented by this controller.
-func findUnsupportedFilter(filters []gatewayv1.HTTPRouteFilter) (gatewayv1.HTTPRouteFilterType, bool) {
-	for _, filter := range filters {
-		switch filter.Type {
-		case gatewayv1.HTTPRouteFilterRequestRedirect,
-			gatewayv1.HTTPRouteFilterRequestHeaderModifier:
-		default:
-			return filter.Type, true
-		}
-	}
-	return "", false
+	return envoyRoutes, allHCMFilterConfigs, allValidBackendRefs, conditions
 }
 
 // buildHTTPRouteAction returns an action, a list of *valid* BackendRefs, and a structured error.
