@@ -351,7 +351,7 @@ func TestTranslateHTTPRouteToEnvoyRoutes(t *testing.T) {
 			route := baseRoute.DeepCopy()
 			route.Spec.Rules = tt.rules
 
-			routes, _, notAccepted, resolvedRefsFailure, partiallyInvalid := translateHTTPRouteToEnvoyRoutes(route, svcLister, noGrants)
+			routes, _, _, notAccepted, resolvedRefsFailure, partiallyInvalid := translateHTTPRouteToEnvoyRoutes(route, svcLister, noGrants)
 
 			if len(routes) != tt.wantRoutes {
 				t.Errorf("got %d routes, want %d", len(routes), tt.wantRoutes)

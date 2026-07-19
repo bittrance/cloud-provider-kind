@@ -209,7 +209,7 @@ func (c *Controller) validateListeners(gateway *gatewayv1.Gateway) map[gatewayv1
 	return listenerConditions
 }
 
-func (c *Controller) translateListenerToFilterChain(gateway *gatewayv1.Gateway, lis gatewayv1.Listener, virtualHosts []*routev3.VirtualHost, routeName string) (*listener.FilterChain, error) {
+func (c *Controller) translateListenerToFilterChain(gateway *gatewayv1.Gateway, lis gatewayv1.Listener, virtualHosts []*routev3.VirtualHost, routeName string, hcmFilters map[string]HCMFilterConfig) (*listener.FilterChain, error) {
 	var filterChain *listener.FilterChain
 
 	switch lis.Protocol {
@@ -220,6 +220,27 @@ func (c *Controller) translateListenerToFilterChain(gateway *gatewayv1.Gateway, 
 			klog.Errorf("Failed to marshal router config: %v", err)
 			return nil, err
 		}
+
+		// Build the ordered list of HTTP filters. Any HCM-level filters (e.g.
+		// ext_authz) must appear before the terminal router filter.
+		// Note: map iteration order is non-deterministic, but the Gateway API does not
+		// currently define filter types whose relative HCM ordering affects correctness
+		// (e.g. JWT extraction before ext_authz).
+		httpFilters := make([]*hcm.HttpFilter, 0, len(hcmFilters)+1)
+		for _, cfg := range hcmFilters {
+			f, err := cfg.buildHCMFilter()
+			if err != nil {
+				klog.Errorf("Failed to build HCM filter %s for listener %s: %v", cfg.FilterName, lis.Name, err)
+				continue
+			}
+			httpFilters = append(httpFilters, f)
+		}
+		httpFilters = append(httpFilters, &hcm.HttpFilter{
+			Name: wellknown.Router,
+			ConfigType: &hcm.HttpFilter_TypedConfig{
+				TypedConfig: routerAny,
+			},
+		})
 
 		hcmConfig := &hcm.HttpConnectionManager{
 			StatPrefix: string(lis.Name),
@@ -240,12 +261,7 @@ func (c *Controller) translateListenerToFilterChain(gateway *gatewayv1.Gateway, 
 					RouteConfigName: routeName,
 				},
 			},
-			HttpFilters: []*hcm.HttpFilter{{
-				Name: wellknown.Router,
-				ConfigType: &hcm.HttpFilter_TypedConfig{
-					TypedConfig: routerAny,
-				},
-			}},
+			HttpFilters: httpFilters,
 		}
 		hcmAny, err := anypb.New(hcmConfig)
 		if err != nil {
@@ -430,6 +446,33 @@ func toEnvoyTlsCertificate(secret *corev1.Secret) (*tlsv3.TlsCertificate, error)
 			},
 		},
 	}, nil
+}
+
+// applyHCMFilterDisabling stamps a "disabled" per-route config onto every route
+// in the virtual-host map that does not already carry an explicit config for each
+// HCM filter that supports per-route selectivity (i.e. has a
+// buildDisabledPerRouteConfig).
+func applyHCMFilterDisabling(virtualHosts map[string]*routev3.VirtualHost, hcmFilters map[string]HCMFilterConfig) error {
+	for _, cfg := range hcmFilters {
+		if cfg.buildDisabledPerRouteConfig == nil {
+			continue
+		}
+		disabledAny, err := cfg.buildDisabledPerRouteConfig()
+		if err != nil {
+			return fmt.Errorf("failed to build disabled per-route config for %s: %w", cfg.FilterName, err)
+		}
+		for _, vh := range virtualHosts {
+			for _, route := range vh.Routes {
+				if _, hasConfig := route.TypedPerFilterConfig[cfg.FilterName]; !hasConfig {
+					if route.TypedPerFilterConfig == nil {
+						route.TypedPerFilterConfig = make(map[string]*anypb.Any)
+					}
+					route.TypedPerFilterConfig[cfg.FilterName] = disabledAny
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func createEnvoyAddress(port uint32) *corev3.Address {
