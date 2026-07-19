@@ -670,9 +670,16 @@ func (c *Controller) areBackendsValid(httpRoute *gatewayv1.HTTPRoute) bool {
 		}
 		for _, filter := range rule.Filters {
 			switch filter.Type {
-			// Add a case here for each new filter type that references an upstream Service.
-			default:
-				continue
+			case gatewayv1.HTTPRouteFilterExternalAuth:
+				if filter.ExternalAuth != nil {
+					ns := httpRoute.Namespace
+					if filter.ExternalAuth.BackendRef.Namespace != nil {
+						ns = string(*filter.ExternalAuth.BackendRef.Namespace)
+					}
+					if _, err := c.serviceLister.Services(ns).Get(string(filter.ExternalAuth.BackendRef.Name)); err != nil {
+						return false
+					}
+				}
 			}
 		}
 	}

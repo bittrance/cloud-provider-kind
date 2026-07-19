@@ -124,6 +124,33 @@ func responsHeaderFilter() gatewayv1.HTTPRouteFilter {
 	}
 }
 
+func externalAuthHTTPFilter(svcName string) gatewayv1.HTTPRouteFilter {
+	return gatewayv1.HTTPRouteFilter{
+		Type: gatewayv1.HTTPRouteFilterExternalAuth,
+		ExternalAuth: &gatewayv1.HTTPExternalAuthFilter{
+			ExternalAuthProtocol: gatewayv1.HTTPRouteExternalAuthHTTPProtocol,
+			BackendRef: gatewayv1.BackendObjectReference{
+				Name: gatewayv1.ObjectName(svcName),
+				Port: ptr.To(gatewayv1.PortNumber(8080)),
+			},
+			HTTPAuthConfig: &gatewayv1.HTTPAuthConfig{},
+		},
+	}
+}
+
+func externalAuthGRPCFilter(svcName string) gatewayv1.HTTPRouteFilter {
+	return gatewayv1.HTTPRouteFilter{
+		Type: gatewayv1.HTTPRouteFilterExternalAuth,
+		ExternalAuth: &gatewayv1.HTTPExternalAuthFilter{
+			ExternalAuthProtocol: gatewayv1.HTTPRouteExternalAuthGRPCProtocol,
+			BackendRef: gatewayv1.BackendObjectReference{
+				Name: gatewayv1.ObjectName(svcName),
+				Port: ptr.To(gatewayv1.PortNumber(9191)),
+			},
+			GRPCAuthConfig: &gatewayv1.GRPCAuthConfig{},
+		},
+	}
+}
 
 func TestTranslateHTTPRouteToEnvoyRoutes_FilterValidation(t *testing.T) {
 	svc := makeService("default", "svc", 80)
@@ -273,3 +300,171 @@ func TestTranslateHTTPRouteToEnvoyRoutes_FilterValidation(t *testing.T) {
 	}
 }
 
+// TestTranslateHTTPRouteToEnvoyRoutes_ExternalAuth exercises the ExternalAuth filter path:
+// verifying that supported ExternalAuth filters are translated into per-route
+// TypedPerFilterConfig entries and that the ExternalAuthConfig is returned correctly.
+func TestTranslateHTTPRouteToEnvoyRoutes_ExternalAuth(t *testing.T) {
+	authSvc := makeService("default", "auth-svc", 8080)
+	authGRPCSvc := makeService("default", "auth-grpc-svc", 9191)
+	regularSvc := makeService("default", "svc", 80)
+	svcLister := newMockServiceLister(authSvc, authGRPCSvc, regularSvc)
+	noGrants := newFakeReferenceGrantLister(nil, nil)
+
+	baseRoute := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "test-route",
+			Namespace:  "default",
+			Generation: 1,
+		},
+	}
+
+	t.Run("HTTP ExternalAuth filter is treated as supported", func(t *testing.T) {
+		route := baseRoute.DeepCopy()
+		route.Spec.Rules = []gatewayv1.HTTPRouteRule{
+			makeRuleWithFilters(externalAuthHTTPFilter("auth-svc")),
+		}
+		routes, hcmFilterConfigs, _, conditions := translateHTTPRouteToEnvoyRoutes(route, svcLister, noGrants)
+
+		if len(routes) != 1 {
+			t.Fatalf("expected 1 route, got %d", len(routes))
+		}
+		if len(hcmFilterConfigs) != 1 {
+			t.Fatalf("expected 1 HCMFilterConfig, got %d", len(hcmFilterConfigs))
+		}
+		cfg := hcmFilterConfigs[0]
+		if cfg.EnableHTTP2 {
+			t.Error("EnableHTTP2 = true, want false for HTTP protocol")
+		}
+		if cfg.BackendRef == nil || string(cfg.BackendRef.Name) != "auth-svc" {
+			t.Errorf("BackendRef.Name = %q, want auth-svc", cfg.BackendRef.Name)
+		}
+
+		// The route must have a per-route TypedPerFilterConfig enabling ext_authz.
+		if routes[0].TypedPerFilterConfig == nil {
+			t.Fatal("expected TypedPerFilterConfig to be set on auth route, got nil")
+		}
+		if _, ok := routes[0].TypedPerFilterConfig["envoy.filters.http.ext_authz"]; !ok {
+			t.Error("expected TypedPerFilterConfig[ext_authz] to be set on auth route")
+		}
+
+		// The ResolvedRefs condition should be True (filter is supported).
+		condByType := make(map[string]metav1.Condition)
+		for _, c := range conditions {
+			condByType[c.Type] = c
+		}
+		resolvedRefs := condByType[string(gatewayv1.RouteConditionResolvedRefs)]
+		if resolvedRefs.Status != metav1.ConditionTrue {
+			t.Errorf("ResolvedRefs.Status = %q, want True", resolvedRefs.Status)
+		}
+	})
+
+	t.Run("gRPC ExternalAuth filter is treated as supported", func(t *testing.T) {
+		route := baseRoute.DeepCopy()
+		route.Spec.Rules = []gatewayv1.HTTPRouteRule{
+			makeRuleWithFilters(externalAuthGRPCFilter("auth-grpc-svc")),
+		}
+		_, hcmFilterConfigs, _, _ := translateHTTPRouteToEnvoyRoutes(route, svcLister, noGrants)
+
+		if len(hcmFilterConfigs) != 1 {
+			t.Fatalf("expected 1 HCMFilterConfig, got %d", len(hcmFilterConfigs))
+		}
+		if !hcmFilterConfigs[0].EnableHTTP2 {
+			t.Error("EnableHTTP2 = false, want true for gRPC protocol")
+		}
+	})
+
+	t.Run("non-auth route returns no HCMFilterConfig", func(t *testing.T) {
+		route := baseRoute.DeepCopy()
+		route.Spec.Rules = []gatewayv1.HTTPRouteRule{
+			makeRuleWithFilters(headerModifierFilter()),
+		}
+		routes, hcmFilterConfigs, _, _ := translateHTTPRouteToEnvoyRoutes(route, svcLister, noGrants)
+
+		if len(hcmFilterConfigs) != 0 {
+			t.Errorf("expected no HCMFilterConfigs, got %d", len(hcmFilterConfigs))
+		}
+		if len(routes) != 1 {
+			t.Fatalf("expected 1 route, got %d", len(routes))
+		}
+		// The route must NOT have a TypedPerFilterConfig for ext_authz.
+		if routes[0].TypedPerFilterConfig != nil {
+			if _, ok := routes[0].TypedPerFilterConfig["envoy.filters.http.ext_authz"]; ok {
+				t.Error("non-auth route must not have TypedPerFilterConfig[ext_authz]")
+			}
+		}
+	})
+
+	t.Run("missing ExternalAuth backend service sets ResolvedRefs False", func(t *testing.T) {
+		route := baseRoute.DeepCopy()
+		route.Spec.Rules = []gatewayv1.HTTPRouteRule{
+			makeRuleWithFilters(externalAuthGRPCFilter("does-not-exist")),
+		}
+		// Use a lister that does not contain the auth backend.
+		emptyLister := newMockServiceLister(regularSvc)
+		routes, hcmFilterConfigs, _, conditions := translateHTTPRouteToEnvoyRoutes(route, emptyLister, noGrants)
+
+		// No HCMFilterConfig should be built for a missing service.
+		if len(hcmFilterConfigs) != 0 {
+			t.Errorf("expected no HCMFilterConfigs for missing service, got %d", len(hcmFilterConfigs))
+		}
+
+		// The route should still be emitted (with a 500 direct response or normal action),
+		// but ResolvedRefs must be False / BackendNotFound.
+		condByType := make(map[string]metav1.Condition)
+		for _, c := range conditions {
+			condByType[c.Type] = c
+		}
+		resolvedRefs, ok := condByType[string(gatewayv1.RouteConditionResolvedRefs)]
+		if !ok {
+			t.Fatal("expected ResolvedRefs condition, got none")
+		}
+		if resolvedRefs.Status != metav1.ConditionFalse {
+			t.Errorf("ResolvedRefs.Status = %q, want False", resolvedRefs.Status)
+		}
+		if resolvedRefs.Reason != string(gatewayv1.RouteReasonBackendNotFound) {
+			t.Errorf("ResolvedRefs.Reason = %q, want BackendNotFound", resolvedRefs.Reason)
+		}
+		_ = routes
+	})
+
+	t.Run("mixed auth and non-auth rules", func(t *testing.T) {
+		route := baseRoute.DeepCopy()
+		route.Spec.Rules = []gatewayv1.HTTPRouteRule{
+			makeRuleWithFilters(externalAuthHTTPFilter("auth-svc")),
+			makeRuleWithFilters(headerModifierFilter()),
+		}
+		routes, hcmFilterConfigs, _, conditions := translateHTTPRouteToEnvoyRoutes(route, svcLister, noGrants)
+
+		if len(routes) != 2 {
+			t.Fatalf("expected 2 routes, got %d", len(routes))
+		}
+		if len(hcmFilterConfigs) != 1 {
+			t.Fatalf("expected 1 HCMFilterConfig (from auth rule), got %d", len(hcmFilterConfigs))
+		}
+
+		// Auth route (index 0) should have the ext_authz marker.
+		if routes[0].TypedPerFilterConfig == nil {
+			t.Fatal("auth route missing TypedPerFilterConfig")
+		}
+		if _, ok := routes[0].TypedPerFilterConfig["envoy.filters.http.ext_authz"]; !ok {
+			t.Error("auth route missing TypedPerFilterConfig[ext_authz]")
+		}
+
+		// Non-auth route (index 1) must NOT have the ext_authz marker at this stage.
+		// (Disabling non-auth routes is a separate step done in buildEnvoyResourcesForGateway.)
+		if routes[1].TypedPerFilterConfig != nil {
+			if _, ok := routes[1].TypedPerFilterConfig["envoy.filters.http.ext_authz"]; ok {
+				t.Error("non-auth route should not have TypedPerFilterConfig[ext_authz] from translateHTTPRouteToEnvoyRoutes")
+			}
+		}
+
+		// Both rules are valid, so no PartiallyInvalid condition.
+		condByType := make(map[string]metav1.Condition)
+		for _, c := range conditions {
+			condByType[c.Type] = c
+		}
+		if _, hasPICondition := condByType[string(gatewayv1.RouteConditionPartiallyInvalid)]; hasPICondition {
+			t.Error("unexpected PartiallyInvalid condition for all-supported filters")
+		}
+	})
+}
