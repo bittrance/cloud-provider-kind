@@ -201,7 +201,7 @@ func New(
 	_, err = gatewayInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			gw := obj.(*gatewayv1.Gateway)
-			if gw.Spec.GatewayClassName != GWClassName {
+			if !c.isOurGateway(gw) {
 				return
 			}
 			key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
@@ -211,7 +211,7 @@ func New(
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			gw := newObj.(*gatewayv1.Gateway)
-			if gw.Spec.GatewayClassName != GWClassName {
+			if !c.isOurGateway(gw) {
 				return
 			}
 			key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(newObj)
@@ -221,7 +221,7 @@ func New(
 		},
 		DeleteFunc: func(obj interface{}) {
 			gw := obj.(*gatewayv1.Gateway)
-			if gw.Spec.GatewayClassName != GWClassName {
+			if !c.isOurGateway(gw) {
 				return
 			}
 			key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
