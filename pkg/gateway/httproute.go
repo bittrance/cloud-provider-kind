@@ -124,12 +124,18 @@ func translateHTTPRouteToEnvoyRoutes(
 					referenceGrantLister,
 				)
 				var controllerErr *ControllerError
-				if errors.As(err, &controllerErr) {
+				var noBackendsErr *noEffectiveBackendsError
+				switch {
+				case errors.As(err, &noBackendsErr):
+					envoyRoute.Action = &routev3.Route_DirectResponse{
+						DirectResponse: &routev3.DirectResponseAction{Status: 500},
+					}
+				case errors.As(err, &controllerErr):
 					overallCondition = createFailureCondition(gatewayv1.RouteConditionReason(controllerErr.Reason), controllerErr.Message, httpRoute.Generation)
 					envoyRoute.Action = &routev3.Route_DirectResponse{
 						DirectResponse: &routev3.DirectResponseAction{Status: 500},
 					}
-				} else {
+				default:
 					allValidBackendRefs = append(allValidBackendRefs, validBackends...)
 					envoyRoute.Action = &routev3.Route_Route{
 						Route: routeAction,
@@ -211,7 +217,7 @@ func buildHTTPRouteAction(namespace string, backendRefs []gatewayv1.HTTPBackendR
 	}
 
 	if len(weightedClusters.Clusters) == 0 {
-		return nil, nil, &ControllerError{Reason: string(gatewayv1.RouteReasonUnsupportedValue), Message: "no valid backends provided with a weight > 0"}
+		return nil, nil, &noEffectiveBackendsError{}
 	}
 
 	var action *routev3.RouteAction

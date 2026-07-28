@@ -85,6 +85,16 @@ func (e *ControllerError) Error() string {
 	return e.Message
 }
 
+// noEffectiveBackendsError is returned by buildHTTPRouteAction when backendRefs
+// is empty or every entry has weight 0. All refs that were specified resolved
+// successfully; the route simply has no backends to forward to. Callers should
+// respond with 500 but must NOT set ResolvedRefs=False.
+type noEffectiveBackendsError struct{}
+
+func (e *noEffectiveBackendsError) Error() string {
+	return "no effective backends: backendRefs is empty or all weights are zero"
+}
+
 type Controller struct {
 	clusterName       string
 	clusterNameserver string
