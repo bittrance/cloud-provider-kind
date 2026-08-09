@@ -8,7 +8,6 @@ import (
 	"net/netip"
 	"runtime"
 	"strings"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -147,8 +146,10 @@ func (c *Controller) configureContainerNetworking(ctx context.Context, container
 	stdinReader := bytes.NewReader(binaryData)
 
 	klog.Infof("Streaming and setting up route-adder utility in %s", containerName)
-	if err := container.Exec(containerName, setupCmd, stdinReader, nil, nil); err != nil {
-		return fmt.Errorf("failed to setup route-adder binary in container %s: %w", containerName, err)
+	var setupStdout, setupStderr bytes.Buffer
+	if err := container.Exec(containerName, setupCmd, stdinReader, &setupStdout, &setupStderr); err != nil {
+		return fmt.Errorf("failed to setup route-adder binary in container %s: %w, stdout: %s, stderr: %s",
+			containerName, err, setupStdout.String(), setupStderr.String())
 	}
 	klog.Infof("Successfully installed route-adder utility in container %s", containerName)
 	routeMap, err := c.getClusterRoutingMap(ctx)
@@ -185,15 +186,9 @@ func (c *Controller) ensureGatewayContainer(ctx context.Context, gw *gatewayv1.G
 	name := gw.Name
 	containerName := gatewayName(c.clusterName, namespace, name)
 
-	if !container.IsRunning(containerName) {
-		klog.Infof("container %s for gateway %s/%s is not running", containerName, namespace, name)
-		if container.Exist(containerName) {
-			if err := container.Delete(containerName); err != nil {
-				return err
-			}
-		}
-	}
-	if !container.Exist(containerName) {
+	state := container.State(containerName)
+	switch state {
+	case "":
 		klog.V(2).Infof("creating container %s for gateway  %s/%s on cluster %s", containerName, namespace, name, c.clusterName)
 		enableTunnels := c.tunnelManager != nil || config.DefaultConfig.LoadBalancerConnectivity == config.Portmap
 		err := createGateway(c.clusterName, c.clusterNameserver, c.xdsLocalAddress, c.xdsLocalPort, gw, enableTunnels)
@@ -201,15 +196,21 @@ func (c *Controller) ensureGatewayContainer(ctx context.Context, gw *gatewayv1.G
 			return err
 		}
 
-		// TODO fix this hack
-		time.Sleep(250 * time.Millisecond)
-
 		if err := c.configureContainerNetworking(ctx, containerName); err != nil {
 			if delErr := container.Delete(containerName); delErr != nil {
 				klog.Errorf("failed to delete container %s after networking setup failed: %v", containerName, delErr)
 			}
 			return fmt.Errorf("failed to configure networking for new gateway container %s: %w", containerName, err)
 		}
+	case "running":
+		klog.V(2).Infof("container %s for gateway %s/%s on cluster %s exists", containerName, namespace, name, c.clusterName)
+	case "exited", "dead":
+		// Truly stopped — safe to remove and recreate.
+		if err := container.Delete(containerName); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("container %s is in unexpected state %q, will retry", containerName, state)
 	}
 	return nil
 }

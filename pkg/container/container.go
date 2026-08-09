@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"k8s.io/klog/v2"
 	kindexec "sigs.k8s.io/kind/pkg/exec"
@@ -97,7 +98,18 @@ func Create(name string, args []string) error {
 	if err := exec.Command(containerRuntime, append([]string{"run", "--name", name}, args...)...).Run(); err != nil {
 		return err
 	}
-	return nil
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		state := State(name)
+		switch state {
+		case "running":
+			return nil
+		case "exited", "dead":
+			return fmt.Errorf("container %s stopped unexpectedly after create", name)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("timed out waiting for container %s to reach Running state", name)
 }
 
 func Restart(name string) error {
@@ -112,6 +124,14 @@ func Delete(name string) error {
 		return err
 	}
 	return nil
+}
+
+func State(name string) string {
+	out, err := exec.Command(containerRuntime, "inspect", "--format", "{{.State.Status}}", name).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func IsRunning(name string) bool {
